@@ -6,16 +6,9 @@ import pandas as pd
 import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
+import joblib
 import streamlit.components.v1 as components
-from sklearn.model_selection import train_test_split
-from sklearn.compose import ColumnTransformer
-from sklearn.preprocessing import OneHotEncoder, StandardScaler
-from sklearn.pipeline import Pipeline
-from sklearn.impute import SimpleImputer
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-from sklearn.linear_model import LinearRegression, Ridge
-from sklearn.tree import DecisionTreeRegressor
-from sklearn.ensemble import RandomForestRegressor, ExtraTreesRegressor, GradientBoostingRegressor, HistGradientBoostingRegressor, VotingRegressor, StackingRegressor
 
 st.set_page_config(page_title="AI IoT Edge–Cloud Decision Lab", page_icon="📡", layout="wide")
 st.markdown("""
@@ -74,52 +67,31 @@ def load_training_dataset():
         raise ValueError(f"Dataset is missing required columns: {sorted(missing)}")
     return df
 
-@st.cache_resource(show_spinner="Training nine regression algorithms on the supplied 72,000-row multi-node IoT dataset...")
-def train_models():
-    df = load_training_dataset()
-    train_df = df[df["dataset_split"].astype(str).str.lower() == "train"].copy()
-    test_df = df[df["dataset_split"].astype(str).str.lower() == "test"].copy()
-    if train_df.empty or test_df.empty:
-        raise ValueError("Dataset must contain rows marked train and test in dataset_split.")
-    Xtr, ytr = train_df[FEATURES], train_df["completion_time_ms"]
-    Xte, yte = test_df[FEATURES], test_df["completion_time_ms"]
-    estimators = [
-        ("Linear Regression", LinearRegression()),
-        ("Ridge Regression", Ridge(alpha=1.0)),
-        ("Decision Tree", DecisionTreeRegressor(max_depth=18, min_samples_leaf=3, random_state=42)),
-        ("Random Forest", RandomForestRegressor(n_estimators=45, min_samples_leaf=2, n_jobs=-1, random_state=42)),
-        ("Extra Trees", ExtraTreesRegressor(n_estimators=45, min_samples_leaf=2, n_jobs=-1, random_state=42)),
-        ("Gradient Boosting", GradientBoostingRegressor(n_estimators=65, max_depth=3, learning_rate=.06, random_state=42)),
-        ("Hist Gradient Boosting", HistGradientBoostingRegressor(max_iter=85, learning_rate=.07, max_leaf_nodes=24, random_state=42)),
-    ]
-    voting = VotingRegressor([
-        ("rf", RandomForestRegressor(n_estimators=30, min_samples_leaf=2, n_jobs=-1, random_state=42)),
-        ("et", ExtraTreesRegressor(n_estimators=30, min_samples_leaf=2, n_jobs=-1, random_state=43)),
-        ("gb", GradientBoostingRegressor(n_estimators=45, max_depth=3, learning_rate=.06, random_state=42))])
-    stacking = StackingRegressor([
-        ("rf", RandomForestRegressor(n_estimators=24, min_samples_leaf=2, n_jobs=-1, random_state=42)),
-        ("et", ExtraTreesRegressor(n_estimators=24, min_samples_leaf=2, n_jobs=-1, random_state=43)),
-        ("gb", GradientBoostingRegressor(n_estimators=40, max_depth=3, learning_rate=.06, random_state=42))],
-        final_estimator=Ridge(alpha=1.0), cv=3, n_jobs=-1)
-    estimators += [("Voting Ensemble", voting), ("Stacking Ensemble", stacking)]
-    fitted, rows, predictions = {}, [], {}
-    for name, est in estimators:
-        prep = ColumnTransformer([
-            ("numeric", Pipeline([("impute", SimpleImputer(strategy="median")), ("scale", StandardScaler())]), NUM),
-            ("categorical", Pipeline([("impute", SimpleImputer(strategy="most_frequent")), ("onehot", OneHotEncoder(handle_unknown="ignore", sparse_output=False))]), CAT),
-        ], sparse_threshold=0)
-        model = Pipeline([("prep", prep), ("regressor", est)])
-        start = time.perf_counter(); model.fit(Xtr, ytr); train_s = time.perf_counter() - start
-        start = time.perf_counter(); yhat = model.predict(Xte); infer_ms = (time.perf_counter() - start) * 1000 / len(Xte)
-        fitted[name] = model; predictions[name] = yhat
-        rows.append({"Algorithm": name, "MAE (ms)": mean_absolute_error(yte, yhat),
-                     "RMSE (ms)": mean_squared_error(yte, yhat) ** .5, "R²": r2_score(yte, yhat),
-                     "Inference (ms/sample)": infer_ms, "Training (s)": train_s})
-    scores = pd.DataFrame(rows).sort_values(["RMSE (ms)", "MAE (ms)"]).reset_index(drop=True)
-    return fitted, scores, Xte.reset_index(drop=True), yte.reset_index(drop=True), predictions, test_df.reset_index(drop=True), len(train_df), len(test_df)
+MODEL_BUNDLE_PATH = Path(__file__).resolve().parent / "trained_models" / "regression_models_bundle.joblib"
 
-with st.spinner("Preparing the AI models for your live task..."):
-    models,scores,Xtest,ytest,test_predictions,test_rows,train_count,test_count=train_models()
+@st.cache_resource(show_spinner="Loading pre-trained IoT regression models...")
+def load_pretrained_models():
+    if not MODEL_BUNDLE_PATH.exists():
+        raise FileNotFoundError(
+            "Pre-trained model bundle is missing. Keep trained_models/regression_models_bundle.joblib "
+            "in the repository beside app.py. See README.md for instructions."
+        )
+    bundle = joblib.load(MODEL_BUNDLE_PATH)
+    required = {"models", "scores", "Xtest", "ytest", "test_predictions", "train_count", "test_count", "best_model_name"}
+    missing = required.difference(bundle)
+    if missing:
+        raise ValueError(f"Pre-trained model bundle is incomplete: {sorted(missing)}")
+    return bundle
+
+bundle = load_pretrained_models()
+models = bundle["models"]
+scores = bundle["scores"]
+Xtest = bundle["Xtest"]
+ytest = bundle["ytest"]
+test_predictions = bundle["test_predictions"]
+train_count = bundle["train_count"]
+test_count = bundle["test_count"]
+best_model_name = bundle["best_model_name"]
 
 # Input panel
 st.sidebar.header("🧾 Enter a NEW IoT task")
@@ -273,7 +245,7 @@ components.html(network_html, height=490, scrolling=False)
 st.caption(f"{'Submitted task' if st.session_state.task_submitted else 'Current task preview'}: **{task_name}** ({app} · {task_type} · {task_priority}) moves from its source device toward **{decision}**. The return packet represents the decision/result path. This is an illustrative animation, not a live network transmission.")
 
 st.subheader("3. AI regression model selection and intelligent execution decision")
-st.caption(f"Models trained from the supplied multi-node dataset: {train_count:,} training rows and {test_count:,} held-out test rows; six candidate locations per task. Train/test partition is provided in the CSV and grouped by task ID.")
+st.caption(f"Pre-trained models loaded from the supplied multi-node dataset: {train_count:,} training rows and {test_count:,} held-out test rows; six candidate locations per task. Train/test partition is provided in the CSV and grouped by task ID.")
 a,b,c,d=st.columns(4)
 a.metric("Best regression model",best_model_name)
 b.metric("Selected execution node",decision)
